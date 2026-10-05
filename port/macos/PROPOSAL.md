@@ -1,8 +1,10 @@
 # Proposal: macOS on Apple silicon (arm64)
 
-Status: proposal. Nothing in this folder builds the game yet. The programs in
-[`measurements/`](measurements) are the evidence for the decisions here.
-Numbers without a program are estimates, and the text says so.
+Status: proposal. Phase 0 is done, except one measurement that needs the
+game data. Nothing in this folder builds the game yet. The programs in
+[`measurements/`](measurements) and [`spike/`](spike) are the evidence for
+the decisions here. Numbers without a program are estimates, and the text
+says so.
 
 Target: every Apple silicon Mac, from the M1 MacBook Air (8 GB, no fan,
 60 Hz) up. The game must run as native arm64 code, with no Rosetta 2.
@@ -122,15 +124,81 @@ One change helps: `gl_initialize` sets `base_vertex` only for ES 3.2
 accepts the extension, the CPU does not rewrite the indices of each indexed
 draw.
 
+### Phase 0: the Android guest in the VM
+
+The program is [`spike/hvf_boot.c`](spike). It does not change the guest
+image.
+
+**The build.** `python configure.py` with the Android NDK r30 (Homebrew
+cask `android-ndk`) and ninja, then `ninja build/android/halo_guest.elf`.
+The unchanged Android guest builds on macOS: 1,463 steps in 86 seconds on
+the M1. The guest compiler is the system's clang (Apple clang 17). No
+object reads a header of the macOS SDK (`ninja -t deps`). Apple clang 17
+is too old for the PGO profile, so `configure.py` builds without it.
+
+**The start.** `hvf_boot` copies the image to its addresses in a 1 GB
+guest space (`0x80000000` to `0xC0000000`), maps it with 2 MB blocks, and
+fills the import table with the guest addresses of trampolines
+(`hvc #index; ret`). The guest's import stubs (`adrp/ldr/br x16`) do not
+change. Then it enters `__guest_start` at EL1. The result:
+
+- The first host call is `host_set_tp`. The program counter after the exit
+  is the instruction after `hvc`, so the trampoline returns with `ret`.
+- musl starts, the constructors run, and `main()` runs. The game writes
+  its default `config.toml` (10,191 bytes) through the host's file system
+  calls, reads it again, and chooses the screen mode. It stops at
+  `host_sdl_set_hint`, the first SDL call, because the program does not
+  serve SDL (that is Phase 1).
+- To get there, the guest makes 85 host calls. 48 of them are
+  `host_get_tp`, the thread pointer. This confirms that the thread pointer
+  must stay in the guest (refer to "The guest").
+- No fault. The host calls that it needed: `host_syscall` (`openat`,
+  `close`, `read`, `readv`, `writev`, `lseek`, `mmap`, `munmap`,
+  `mprotect`, `brk`, `ioctl`, `gettid`), `host_get_tp`, `host_set_tp`,
+  `host_memory_watch_forget`.
+
+**The speed of compiled code in the guest.** The game source compiles only
+for 32-bit pointers, so the same game code cannot run natively on macOS.
+monocypher (`port/third_party/monocypher`, in the image for the network
+code) uses fixed-width types, so its source compiles both ways. With
+`--bench`, `hvf_boot` calls the image's monocypher functions after the
+start. `bench_native.c` does the same work natively. `bench_lp64.elf` is
+the native (64-bit) code, linked as an ELF image at `0xB8000000`, so that
+the same instructions also run in the guest. All builds: Apple clang 17,
+`-O2 -mcpu=cortex-a53 -ffp-contract=off`, as the guest. Milliseconds, best
+of five, two runs:
+
+| Work | Native, 64-bit | Guest, the same 64-bit code | Guest, the image (`arm64_32`) |
+| --- | --- | --- | --- |
+| BLAKE2b of 64 MB | 63.5 to 63.8 | 63.6 to 66.6 | 63.0 to 63.3 |
+| SHA-512 of 64 MB | 126.4 to 126.5 | 125.3 to 125.4 | 138.1 to 138.9 (+10%) |
+| 2,000 X25519 | 144.1 | 145.1 to 145.3 | 150.7 to 151.0 (+5%) |
+
+Each column gives the same hashes, so the guest computes correctly. Two
+results:
+
+1. **The VM costs nothing measurable on this code.** The same instructions
+   take the same time in the guest and natively (within ±1%, except one
+   BLAKE2b run at +4%).
+2. **The `arm64_32` code is up to 10% slower than the 64-bit code** from the
+   same source. In `sha512_compress`, the `arm64_32` code has 39 `ldr` and
+   129 `add` instructions where the 64-bit code has 9 `ldr`, 17 `ldp` and
+   100 `add`: with 32-bit pointers, clang computes each address and loads
+   one register at a time. This cost is not from the VM. The Android port
+   has it today, and option D (wasm32) also has 32-bit pointers. Only
+   option C (64-bit pointers) removes it.
+
+`-mcpu=apple-m1` in place of `-mcpu=cortex-a53` (native, 64-bit): BLAKE2b
+65.3 ms, SHA-512 141.4 ms, X25519 138.2 ms. It is not faster on this code.
+
 ### Not measured yet
 
 - **Draws and GL calls per frame.** The game data was not available. The
   renderer counts draws (`stats` at `d3d8_gl.c:385-393`, printed every 60
   frames with `debug.gpu_stats`). The Android build can print them too.
-- **The game in the guest.** The microbenchmarks above bound the cost.
-  Only the game itself gives the real number (Phase 0).
-- **A build of the guest on macOS.** Nothing is built yet (refer to "Build
-  and CI").
+- **The game itself in the guest.** It needs the Phase 1 host (SDL, GL,
+  threads) and the game data. The results above say that the VM adds
+  nothing to CPU work, and the stage-2 table above bounds the memory cost.
 
 ## Options considered
 
@@ -464,8 +532,9 @@ shows that ANGLE's translation costs a significant part of the frame.
 - The Android guest build needs the Android NDK today. Without it,
   `configure.py` writes no Android build (`android_build.py:207-210`). The
   NDK gives the guest `ld.lld`, `llvm-ar`, the compiler-rt builtins and the
-  ES headers. The NDK has a macOS version, so the first step is to use it
-  as it is. Later, Homebrew's LLVM and the Khronos headers can replace it.
+  ES headers. The NDK has a macOS version (Homebrew cask `android-ndk`,
+  r30). With it, the guest builds on macOS unchanged (measured, Phase 0).
+  Later, Homebrew's LLVM and the Khronos headers can replace it.
 - `configure.py` gets a `macos` target. `tools/macos_build.py` follows
   `tools/android_build.py`: the guest build is the same, the host build
   uses the Apple clang of the system, and the bundle step signs the app.
@@ -474,7 +543,9 @@ shows that ANGLE's translation costs a significant part of the frame.
   and ANGLE (built once, or from a prebuilt package).
 - PGO: `pgo/` has the Linux and Windows profiles. The Android guest uses
   the Linux profile (`android_build.py:351`). It needs clang 22 or later
-  (`linux_build.py:229`). Apple clang 17 ignores it with a warning.
+  (`linux_build.py:229`). With Apple clang 17, `configure.py` builds the
+  guest without it. Homebrew has LLVM 23.1.2, which is new enough (not
+  tested). `--android-guest-cc` selects it.
 - GitHub's arm64 macOS runners are M1 machines inside VMs. GitHub says
   that they do not give nested virtualization, and a request for
   Hypervisor.framework on them was closed as not planned. So CI builds and
@@ -489,7 +560,7 @@ commitments.
 
 | Phase | Work | Result that ends the phase | Estimate |
 | --- | --- | --- | --- |
-| 0. Spike | Build `halo_guest.elf` on macOS with the NDK. A minimal host that maps it, sets up the EL1 page tables and runs `__guest_start` to its first host call. A CPU benchmark of the game code in the guest against the same code natively (for example the `.c` files of `source/math` and the tag loader on a cache file). On Linux or Android: draws and GL calls per frame in a heavy scene, with `debug.gpu_stats`. Done: the 4 KB granule, the stage-2 cost of memory access, ANGLE's capabilities (this file). | The numbers in a table in this file. If the game code in the guest is more than 10% slower than native, stop, and evaluate option D. | 1–2 weeks |
+| 0. Spike | Done: the guest build on macOS with the NDK; a minimal host that maps the image, sets up the EL1 page tables and runs `__guest_start` through `main()` to the first SDL call; compiled code in the guest against the same code natively; the 4 KB granule; the stage-2 cost of memory access; ANGLE's capabilities (refer to "Measurements"). Open: draws and GL calls per frame in a heavy scene, with `debug.gpu_stats`, on Linux or Android (needs the game data). | The numbers in this file. The gate was: if code in the guest is more than 10% slower than the same code natively, stop and evaluate option D. Result: the VM adds no measurable cost (±1%). The `arm64_32` code is up to 10% slower than 64-bit code, but every 32-bit-pointer option has that cost, D included. | 1–2 weeks |
 | 1. Boot | The full host: memory, threads, system calls, SDL, sockets. The guest's thread pointer, clock and watch. GL with one exit for each call (correct, slow). ANGLE. | The main menu, then a campaign level, on an M1 Air. The debug build has no failed assertions. | 5–7 weeks |
 | 2. Speed | The GL command ring and the render thread. Profile with Instruments. | 60 frames each second in "The Pillar of Autumn" and "Assault on the Control Room" on an M1 Air at its native resolution, with frame times in a table. Package power measured. | 3–4 weeks |
 | 3. Release | The `.app` bundle, signing, the updater, the macOS paths, controllers, system link with Linux, Windows and Android machines, the README for macOS. | A release zip from CI. A system link game with all four platforms. | 2–3 weeks |
@@ -499,7 +570,8 @@ commitments.
 
 | Risk | Effect | What to do |
 | --- | --- | --- |
-| The second stage of address translation slows the game | The game's memory access is slower than native. Measured worst case with 2 MB blocks: +14% at 256 MB of random access. | Map with 2 MB blocks. Phase 0 measures the game. |
+| The second stage of address translation slows the game | The game's memory access is slower than native. Measured worst case with 2 MB blocks: +14% at 256 MB of random access. Compiled code with its own memory access: no measurable cost (Phase 0). | Map with 2 MB blocks. Measure the game in Phase 1. |
+| The `arm64_32` code generation | Up to 10% slower than 64-bit code from the same source (measured on SHA-512) | The Android port has the same cost. PGO with clang 22 or later may reduce it (not measured). Only option C removes it. |
 | Frequent host calls that this proposal did not find | Each is an exit of ~0.75 µs | Count the exits by import number in the host in Phase 1. Move the frequent ones into the guest, as for the thread pointer and the clock. |
 | Synchronous GL calls in the frame | The ring flushes too often, and the game waits for the render thread | Count the flushes in Phase 2. The design above leaves one wait for each frame. |
 | Host writes into watched memory | A texture is not uploaded again after the host writes it | Record the host's writes in the watch (refer to "The host"). |
@@ -556,6 +628,11 @@ codesign -s - --entitlements hypervisor.entitlements -f hvf_mmu && ./hvf_mmu
 clang -O2 angle_caps.c -o angle_caps
 ./angle_caps "/Applications/Visual Studio Code.app/Contents/Frameworks/Electron Framework.framework/Libraries"
 ```
+
+Phase 0 (`port/macos/spike`): the first comments of `hvf_boot.c` and
+`bench_native.c` give the build commands. `hvf_boot` needs
+`build/android/halo_guest.elf` (`ninja build/android/halo_guest.elf`, with
+the NDK).
 
 `angle_caps` needs a folder with `libEGL.dylib` and `libGLESv2.dylib`. Any
 Electron app has one. Add results from other Macs (M2, M3, M4) to the
